@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#000000">
+  <title>Mago</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      width: 100%; height: 100%; overflow: hidden; position: fixed;
+      background: #000; color: #666; font-family: system-ui, sans-serif;
+      touch-action: none; user-select: none;
+    }
+    #canvas {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      touch-action: none; background: #000; z-index: 1;
+    }
+    #ui {
+      position: absolute; top: 0; left: 0; right: 0; z-index: 10;
+      padding: calc(env(safe-area-inset-top, 8px) + 4px) 8px;
+      display: flex; justify-content: space-between; align-items: center;
+      opacity: 0.25; transition: opacity 0.3s;
+    }
+    #ui:active, #ui:hover { opacity: 0.9; }
+    #ui.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+    .text-btn {
+      background: transparent; color: #555; border: none;
+      font-size: 11px; font-weight: 500; cursor: pointer; padding: 6px;
+    }
+    #status { font-size: 9px; color: #333; }
+    #stealthHint {
+      position: absolute; bottom: calc(env(safe-area-inset-bottom, 16px) + 10px);
+      left: 0; right: 0; text-align: center; z-index: 5;
+      font-size: 12px; color: #22c55e; opacity: 0; transition: opacity 0.4s;
+      pointer-events: none;
+    }
+    #stealthHint.show { opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="ui">
+    <button class="text-btn" id="btnStealth">sigilo</button>
+    <span id="status">•</span>
+  </div>
+  <div id="stealthHint">3 toques rápidos para salir del sigilo</div>
+
+  <script src="https://unpkg.com/mqtt@5.10.4/dist/mqtt.min.js"></script>
+  <script>
+    (function () {
+      'use strict';
+      const SECRET = 'ninja-mago-asistente-privado-2025-x7k9';
+      const TOPIC = `stealthdraw/fixed/${SECRET}`;
+      const BC_NAME = `stealth-fixed-${SECRET}`;
+      const CLIENT_ID = 'mago_' + Math.random().toString(36).slice(2, 9);
+
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const ui = document.getElementById('ui');
+      const statusEl = document.getElementById('status');
+      const btnStealth = document.getElementById('btnStealth');
+      const stealthHint = document.getElementById('stealthHint');
+
+      let dpr=1, cssW=0, cssH=0, drawing=false, currentPoints=[], stealthMode=false, lastTapTimes=[];
+      let mqttClient=null, bc=null, connectedMqtt=false;
+      let longPressTimer = null, hasMoved = false, startPos = null;
+
+      // Control preciso de taps por presión directa
+      let tapTimestamps = [];
+
+      function resize() {
+        dpr = Math.min(devicePixelRatio||1, 2.5);
+        cssW = innerWidth; cssH = innerHeight;
+        canvas.width = Math.floor(cssW*dpr); canvas.height = Math.floor(cssH*dpr);
+        canvas.style.width = cssW+'px'; canvas.style.height = cssH+'px';
+        ctx.setTransform(dpr,0,0,dpr,0,0);
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        redraw();
+      }
+      addEventListener('resize', resize);
+      addEventListener('orientationchange', () => setTimeout(resize, 120));
+      resize();
+
+      function clearCanvas() {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0,0,cssW,cssH);
+      }
+      function drawStroke(pts, color, w) {
+        if (!pts || pts.length < 2) return;
+        ctx.save();
+        ctx.strokeStyle = color; ctx.lineWidth = w;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x*cssW, pts[0].y*cssH);
+        for (let i=1; i<pts.length; i++) ctx.lineTo(pts[i].x*cssW, pts[i].y*cssH);
+        ctx.stroke(); ctx.restore();
+      }
+      function redraw() {
+        clearCanvas();
+        if (currentPoints.length > 1) {
+          const col = stealthMode ? 'rgba(15,15,15,0.3)' : 'rgba(200,200,200,0.85)';
+          drawStroke(currentPoints, col, stealthMode ? 2.5 : 3.8);
+        }
+      }
+
+      function getPos(e) {
+        const r = canvas.getBoundingClientRect();
+        return {
+          x: Math.max(0, Math.min(1, (e.clientX-r.left)/r.width)),
+          y: Math.max(0, Math.min(1, (e.clientY-r.top)/r.height))
+        };
+      }
+
+      function send(payload) {
+        try { if (bc) bc.postMessage(payload); } catch{}
+        try { if (mqttClient && connectedMqtt) mqttClient.publish(TOPIC, JSON.stringify(payload), {qos:0}); } catch{}
+      }
+
+      function start(e) {
+        if (e.button !== undefined && e.button !== 0) return;
+        e.preventDefault(); 
+        drawing = true; 
+        hasMoved = false;
+        startPos = getPos(e);
+        currentPoints = [startPos];
+
+        // Mantener presionado = Opción "( )"
+        clearTimeout(longPressTimer);
+        longPressTimer = setTimeout(() => {
+          if (drawing && !hasMoved) {
+            drawing = false;
+            currentPoints = [];
+            redraw();
+            send({ type: 'stroke', id: 'cmd_option_' + Date.now(), from: CLIENT_ID, isCommand: 'option', points: [] });
+            if (navigator.vibrate) navigator.vibrate(70);
+          }
+        }, 750);
+      }
+
+      function move(e) {
+        if (!drawing) return; 
+        e.preventDefault();
+        const p = getPos(e);
+        
+        if (startPos && Math.hypot(p.x - startPos.x, p.y - startPos.y) > 0.015) {
+          if (!hasMoved) {
+            hasMoved = true;
+            clearTimeout(longPressTimer);
+          }
+        }
+
+        const last = currentPoints[currentPoints.length-1];
+        if ((p.x-last.x)**2 + (p.y-last.y)**2 > 0.00003) {
+          currentPoints.push(p); 
+          redraw();
+        }
+      }
+
+      function end(e) {
+        clearTimeout(longPressTimer);
+        if (!drawing) return; 
+        e.preventDefault(); 
+        drawing = false;
+
+        // Si el dedo apenas se movió, cuenta como toque limpio
+        if (!hasMoved) {
+          const now = Date.now();
+          tapTimestamps.push(now);
+          // Filtrar toques ocurridos en los últimos 500ms
+          tapTimestamps = tapTimestamps.filter(t => now - t < 500);
+
+          if (tapTimestamps.length === 3) {
+            // 3 toques rápidos = Pregunta:
+            tapTimestamps = [];
+            send({ type: 'stroke', id: 'cmd_question_' + Date.now(), from: CLIENT_ID, isCommand: 'question', points: [] });
+            if (navigator.vibrate) navigator.vibrate([70, 40, 70]);
+          } else if (tapTimestamps.length === 2) {
+            // 2 toques rápidos = Bajar renglón
+            send({ type: 'stroke', id: 'cmd_newline_' + Date.now(), from: CLIENT_ID, isCommand: 'newline', points: [] });
+            if (navigator.vibrate) navigator.vibrate(45);
+          } else if (tapTimestamps.length === 1) {
+            // 1 toque rápido = Espacio inmediato
+            setTimeout(() => {
+              if (tapTimestamps.length === 1) {
+                tapTimestamps = [];
+                send({ type: 'stroke', id: 'cmd_space_' + Date.now(), from: CLIENT_ID, isCommand: 'space', points: [] });
+                if (navigator.vibrate) navigator.vibrate(20);
+              }
+            }, 200); // Pequeña ventana para ver si se convierte en doble toque
+          }
+        }
+
+        if (hasMoved && currentPoints.length >= 2) {
+          send({
+            type: 'stroke',
+            id: CLIENT_ID + '-' + Date.now() + '-' + Math.random().toString(36).slice(2,6),
+            from: CLIENT_ID,
+            points: currentPoints,
+            ts: Date.now()
+          });
+        }
+        currentPoints = []; 
+        redraw();
+      }
+
+      canvas.addEventListener('pointerdown', start);
+      canvas.addEventListener('pointermove', move);
+      canvas.addEventListener('pointerup', end);
+      canvas.addEventListener('pointercancel', end);
+      canvas.addEventListener('pointerleave', e => { if (drawing) end(e); });
+
+      document.addEventListener('touchmove', e => { if (e.target===canvas || stealthMode) e.preventDefault(); }, {passive:false});
+      canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+      function enterStealth() {
+        stealthMode = true; 
+        ui.classList.add('hidden');
+        stealthHint.classList.add('show');
+        setTimeout(() => stealthHint.classList.remove('show'), 3000);
+        redraw();
+      }
+      function exitStealth() {
+        stealthMode = false; 
+        ui.classList.remove('hidden'); 
+        redraw(); 
+        updateStatus();
+      }
+      btnStealth.onclick = () => stealthMode ? exitStealth() : enterStealth();
+
+      canvas.addEventListener('pointerdown', () => {
+        if (!stealthMode) return;
+        const now = Date.now();
+        lastTapTimes.push(now);
+        lastTapTimes = lastTapTimes.filter(t => now-t < 850);
+        if (lastTapTimes.length >= 3) { lastTapTimes = []; exitStealth(); }
+      });
+
+      try { bc = new BroadcastChannel(BC_NAME); } catch{}
+
+      function connect() {
+        try {
+          mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+            clientId: 'm_'+CLIENT_ID, clean:true, connectTimeout:8000, reconnectPeriod:4000
+          });
+          mqttClient.on('connect', () => { connectedMqtt=true; mqttClient.subscribe(TOPIC); updateStatus(); });
+          mqttClient.on('error', () => { connectedMqtt=false; updateStatus(); });
+          mqttClient.on('close', () => { connectedMqtt=false; updateStatus(); });
+        } catch{}
+      }
+      connect();
+
+      function updateStatus() { statusEl.textContent = connectedMqtt ? '•' : '…'; }
+    })();
+  </script>
+</body>
+</html>
